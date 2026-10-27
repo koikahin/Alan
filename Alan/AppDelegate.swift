@@ -11,6 +11,8 @@ import ApplicationServices
 @main
 class AppDelegate: NSObject, NSApplicationDelegate {
 
+    private var statusBarController: StatusBarController?
+
     let prefsWindowController: PrefsWindowController = {
         return PrefsWindowController(windowNibName: String(describing: PrefsWindowController.self))
     }()
@@ -18,6 +20,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ aNotification: Notification) {
 
         UserDefaults.standard.register(defaults: [
+            Key.enabled: true,
             Key.width: 5,
             Key.inset: 4,
             Key.hideDock: false
@@ -27,9 +30,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.setActivationPolicy(.accessory)
         }
 
+        let controller = StatusBarController(onToggle: { enabled in
+            if enabled {
+                guard AXIsProcessTrusted() else {
+                    throw NSError(domain: "studio.retina.Alan", code: Int(AXError.apiDisabled.rawValue), userInfo: [
+                        NSLocalizedDescriptionKey: "Allow Alan in System Settings → Privacy & Security → Accessibility, then try again."
+                    ])
+                }
+                try FocusHighlighter.shared.start()
+            } else {
+                FocusHighlighter.shared.stop()
+            }
+            UserDefaults.standard.set(enabled, forKey: Key.enabled)
+        }, onOptions: { [weak self] in
+            self?.showPrefs(nil)
+        })
+        statusBarController = controller
+
+        // A paused app still provides its icon, Options, and Quit without asking
+        // for Accessibility permission until highlighting is enabled again.
+        guard UserDefaults.standard.bool(forKey: Key.enabled) else { return }
         guard requestAccessibilityPermissionIfNeeded() else { return }
         do {
-            try FocusHighlighter.shared.start()
+            try controller.setEnabled(true)
         } catch {
             let alert = NSAlert()
             alert.messageText = "Window Tracking Could Not Start"
@@ -41,6 +64,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         FocusHighlighter.shared.stop()
+        statusBarController?.remove()
     }
 
     private func requestAccessibilityPermissionIfNeeded() -> Bool {
@@ -76,6 +100,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @IBAction func showPrefs(_ sender: AnyObject?) {
+        NSApp.activate()
         prefsWindowController.showWindow(nil)
         prefsWindowController.window?.makeKeyAndOrderFront(nil)
     }

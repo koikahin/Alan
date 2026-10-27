@@ -8,6 +8,14 @@ poller with Accessibility observers and macOS application, display, and Space
 notifications. It uses public AppKit and Accessibility APIs, with no external
 dependencies or private WindowServer calls.
 
+## Menu bar
+
+- Left-click the window-shaped Alan icon to turn highlighting on or off.
+- The icon dims when highlighting is off, but remains clickable.
+- Right-click (or Control-click) for **Options…** and **Quit Alan**.
+- The on/off setting is remembered between launches. Turning highlighting off
+  hides the border and disconnects its observers; the menu bar icon stays available.
+
 ## Tracking behavior
 
 - Reads the app's focused window, with a containing-window fallback for apps

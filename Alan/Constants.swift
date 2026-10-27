@@ -13,6 +13,7 @@ struct Defaults {
 }
 
 struct Key {
+    static let enabled = "enabled"
     static let width = "width"
     static let inset = "inset"
     static let hideDock = "hideDock"
