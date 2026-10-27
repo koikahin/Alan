@@ -20,21 +20,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         UserDefaults.standard.register(defaults: [
             Key.width: 5,
             Key.inset: 4,
-            Key.hideDock: false,
-            Key.lightMode: Defaults.lightModeColor,
-            Key.darkMode: Defaults.darkModeColor
+            Key.hideDock: false
         ])
 
         if UserDefaults.standard.bool(forKey: Key.hideDock) == true {
             NSApp.setActivationPolicy(.accessory)
         }
 
-        requestAccessibilityPermissionIfNeeded()
-
-        FocusHighlighter.shared.start()
+        guard requestAccessibilityPermissionIfNeeded() else { return }
+        do {
+            try FocusHighlighter.shared.start()
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "Window Tracking Could Not Start"
+            alert.informativeText = String(describing: error)
+            alert.runModal()
+            NSApp.terminate(nil)
+        }
     }
 
-    func requestAccessibilityPermissionIfNeeded() {
+    func applicationWillTerminate(_ notification: Notification) {
+        FocusHighlighter.shared.stop()
+    }
+
+    private func requestAccessibilityPermissionIfNeeded() -> Bool {
         let options: CFDictionary = [
             kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true
         ] as CFDictionary
@@ -61,8 +70,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             alert.runModal()
 
             NSApp.terminate(nil)
-            return
+            return false
         }
+        return true
     }
 
     @IBAction func showPrefs(_ sender: AnyObject?) {

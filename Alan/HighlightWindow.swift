@@ -9,6 +9,9 @@ import AppKit
 
 class HighlightWindow: NSWindow {
 
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+
     init() {
         super.init(
             contentRect: .zero,
@@ -21,8 +24,8 @@ class HighlightWindow: NSWindow {
         self.hasShadow = false
         self.backgroundColor = .clear
         self.ignoresMouseEvents = true
-        self.level = .statusBar
-        self.collectionBehavior = [.canJoinAllSpaces, .ignoresCycle]
+        self.level = .floating
+        self.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
         self.isReleasedWhenClosed = false
         
         self.contentView = HighlightView(frame: .zero)
@@ -38,6 +41,11 @@ class HighlightWindow: NSWindow {
 
 class HighlightView: NSView {
     override var isFlipped: Bool { true }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)

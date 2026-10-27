@@ -1,118 +1,252 @@
-//
-//  FocusHighlighter.swift
-//  Alan
-//
-//  Created by Tyler Hall on 11/26/25.
-//
-
 import AppKit
 import ApplicationServices
+import os
 
-class FocusHighlighter {
-    
+@MainActor
+final class FocusHighlighter: NSObject {
     static let shared = FocusHighlighter()
 
-    private let systemWideElement = AXUIElementCreateSystemWide()
     private let highlightWindow = HighlightWindow()
-    private var timer: Timer?
+    private let accessibility = AccessibilityWindow()
+    private let logger = Logger(subsystem: "studio.retina.Alan", category: "FocusTracking")
+    private var observer: AXObserver?
+    private var application: AXUIElement?
+    private var applicationPID: pid_t?
+    private var observedWindow: AXUIElement?
+    private var windowNotifications: [String] = []
+    private var pendingRefresh: DispatchWorkItem?
     private var lastFrame: CGRect?
+    private var started = false
+    private var suspended = false
+    private let retryDelays: [TimeInterval] = [0.05, 0.15, 0.5]
 
-    func start() {
-        handleFocusChange()
+    private override init() { super.init() }
 
-        timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
-            self?.handleFocusChange()
+    func start() throws {
+        guard !started else { return }
+        // A timeout on one AX element does not apply to its children. Set the
+        // process-wide timeout so an unresponsive app cannot stall all tracking.
+        let error = AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 0.25)
+        guard error == .success else {
+            throw FocusTrackingError.accessibility("Set query timeout", error)
         }
-
-        if let timer = timer {
-            RunLoop.current.add(timer, forMode: .common)
+        started = true
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.didActivateApplicationNotification,
+                     NSWorkspace.didLaunchApplicationNotification,
+                     NSWorkspace.didTerminateApplicationNotification,
+                     NSWorkspace.didHideApplicationNotification,
+                     NSWorkspace.didUnhideApplicationNotification,
+                     NSWorkspace.activeSpaceDidChangeNotification] {
+            workspaceCenter.addObserver(self, selector: #selector(environmentChanged), name: name, object: nil)
         }
+        for name in [NSWorkspace.sessionDidResignActiveNotification, NSWorkspace.screensDidSleepNotification] {
+            workspaceCenter.addObserver(self, selector: #selector(suspendTracking), name: name, object: nil)
+        }
+        for name in [NSWorkspace.sessionDidBecomeActiveNotification, NSWorkspace.screensDidWakeNotification] {
+            workspaceCenter.addObserver(self, selector: #selector(resumeTracking), name: name, object: nil)
+        }
+        NotificationCenter.default.addObserver(self, selector: #selector(environmentChanged),
+                                               name: NSApplication.didChangeScreenParametersNotification, object: nil)
+        requestRefresh()
+    }
+
+    func stop() {
+        started = false
+        suspended = false
+        pendingRefresh?.cancel()
+        pendingRefresh = nil
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+        NotificationCenter.default.removeObserver(self)
+        disconnectApplication()
+        hideBorder()
     }
 
     func forceUpdate() {
-        guard let lastFrame else { return }
+        guard let lastFrame, highlightWindow.isVisible else { return }
         highlightWindow.updateFrame(to: lastFrame)
     }
-    
-    private func handleFocusChange() {
-        guard let axFrame = currentFocusedWindowFrame() else {
-            if highlightWindow.isVisible {
-                highlightWindow.orderOut(nil)
-                lastFrame = nil
+
+    @objc private func environmentChanged() {
+        // Never leave the old app's border visible during a Space/app change.
+        hideBorder()
+        requestRefresh()
+    }
+
+    @objc private func suspendTracking() {
+        suspended = true
+        pendingRefresh?.cancel()
+        pendingRefresh = nil
+        hideBorder()
+    }
+
+    @objc private func resumeTracking() {
+        suspended = false
+        disconnectApplication()
+        requestRefresh()
+    }
+
+    private func requestRefresh() {
+        guard started, !suspended else { return }
+        pendingRefresh?.cancel()
+        enqueueRefresh(attempt: 0, delay: 0)
+    }
+
+    private func enqueueRefresh(attempt: Int, delay: TimeInterval) {
+        let work = DispatchWorkItem { [weak self] in self?.refresh(attempt: attempt) }
+        pendingRefresh = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    private func refresh(attempt: Int) {
+        pendingRefresh = nil
+        guard started, !suspended else { return }
+        do {
+            guard let frontmost = NSWorkspace.shared.frontmostApplication, !frontmost.isTerminated else {
+                disconnectApplication()
+                hideBorder()
+                return
             }
-            return
-        }
-
-        let cocoaFrame = cocoaRect(fromAXRect: axFrame)
-
-        if lastFrame != cocoaFrame {
-            lastFrame = cocoaFrame
-            highlightWindow.updateFrame(to: cocoaFrame)
+            if frontmost.processIdentifier != applicationPID || observer == nil {
+                try connectApplication(pid: frontmost.processIdentifier)
+            }
+            guard !frontmost.isHidden, let application else {
+                hideBorder()
+                return
+            }
+            guard let window = try accessibility.focusedWindow(in: application) else {
+                unobserveWindow()
+                hideBorder()
+                retryIfNeeded(attempt: attempt)
+                return
+            }
+            let windowChanged = observedWindow.map { !CFEqual($0, window) } ?? true
+            if windowChanged {
+                unobserveWindow()
+                observedWindow = window
+                do {
+                    try observeWindow(window)
+                } catch {
+                    unobserveWindow()
+                    throw error
+                }
+            }
+            guard let axFrame = try accessibility.frame(of: window) else {
+                hideBorder()
+                retryIfNeeded(attempt: attempt)
+                return
+            }
+            // NSScreen.main follows keyboard focus. The first screen is the
+            // menu-bar display and is the correct coordinate-system anchor.
+            guard let primaryScreen = NSScreen.screens.first,
+                  let frame = WindowGeometry.cocoaRect(from: axFrame, primaryScreen: primaryScreen.frame) else {
+                throw FocusTrackingError.invalidValue("window/display geometry")
+            }
+            if windowChanged || frame != lastFrame || !highlightWindow.isVisible {
+                lastFrame = frame
+                highlightWindow.updateFrame(to: frame)
+            }
+        } catch {
+            hideBorder()
+            logger.error("Focus update: \(String(describing: error), privacy: .public)")
+            retryIfNeeded(attempt: attempt)
         }
     }
 
-    // Hello, darkness, my old friend. I'm still really bad at this API.
-    private func currentFocusedWindowFrame() -> CGRect? {
-        var focusedElement: CFTypeRef?
-        let err = AXUIElementCopyAttributeValue(
-            systemWideElement,
-            kAXFocusedUIElementAttribute as CFString,
-            &focusedElement
-        )
-
-        guard err == .success, let element = focusedElement as! AXUIElement? else {
-            return nil
-        }
-
-        // If focus is a child, ask for its window
-        var windowElement: CFTypeRef?
-        let windowErr = AXUIElementCopyAttributeValue(
-            element,
-            kAXWindowAttribute as CFString,
-            &windowElement
-        )
-
-        let targetElement: AXUIElement
-        if windowErr == .success, let w = windowElement as! AXUIElement? {
-            targetElement = w
-        } else {
-            targetElement = element
-        }
-
-        var frameValue: CFTypeRef?
-        let frameErr = AXUIElementCopyAttributeValue(
-            targetElement,
-            "AXFrame" as CFString,
-            &frameValue
-        )
-
-        guard frameErr == .success,
-              let cfValue = frameValue,
-              CFGetTypeID(cfValue) == AXValueGetTypeID()
-        else {
-            return nil
-        }
-
-        var rect = CGRect.zero
-        if AXValueGetType(cfValue as! AXValue) == .cgRect {
-            AXValueGetValue(cfValue as! AXValue, .cgRect, &rect)
-            return rect
-        }
-
-        return nil
+    private func retryIfNeeded(attempt: Int) {
+        // A focus/Space transition can briefly expose no window or time out.
+        // Retry only this event, with a strict bound; there is no idle poller.
+        guard attempt < retryDelays.count else { return }
+        enqueueRefresh(attempt: attempt + 1, delay: retryDelays[attempt])
     }
-}
 
-private func cocoaRect(fromAXRect axRect: CGRect) -> CGRect {
-    // Find the maximum Y coordinate across all screens in Cocoa space
-    // This represents the total height of the entire screen arrangement
-    // AX coordinates start from y=0 at the top of the topmost screen
-    // Cocoa coordinates start from y=0 at the bottom of the bottommost screen
-    // So we need the total height to properly flip the Y coordinate
-    let maxY = NSScreen.screens.map { $0.frame.maxY }.max() ?? 0
+    private func connectApplication(pid: pid_t) throws {
+        disconnectApplication()
+        let app = AXUIElementCreateApplication(pid)
+        var newObserver: AXObserver?
+        let error = AXObserverCreate(pid, { observer, element, notification, context in
+            FocusHighlighter.accessibilityNotification(observer: observer, element: element,
+                                                       notification: notification, context: context)
+        }, &newObserver)
+        guard error == .success, let newObserver else {
+            throw FocusTrackingError.accessibility("Create observer for \(pid)", error)
+        }
+        var hasFocusNotification = false
+        for name in [kAXFocusedWindowChangedNotification, kAXMainWindowChangedNotification,
+                     kAXFocusedUIElementChangedNotification] {
+            hasFocusNotification = try subscribe(newObserver, element: app, name: name) || hasFocusNotification
+        }
+        guard hasFocusNotification else { throw FocusTrackingError.notificationsUnavailable(pid) }
+        for name in [kAXWindowCreatedNotification, kAXApplicationHiddenNotification, kAXApplicationShownNotification] {
+            _ = try subscribe(newObserver, element: app, name: name)
+        }
+        application = app
+        applicationPID = pid
+        observer = newObserver
+        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(newObserver), .commonModes)
+    }
 
-    var rect = axRect
-    rect.origin.y = maxY - (axRect.origin.y + axRect.height)
+    private func disconnectApplication() {
+        unobserveWindow()
+        if let observer {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+        }
+        observer = nil
+        application = nil
+        applicationPID = nil
+    }
 
-    return rect
+    private func observeWindow(_ window: AXUIElement) throws {
+        guard let observer else { return }
+        for name in [kAXMovedNotification, kAXResizedNotification,
+                     kAXWindowMovedNotification, kAXWindowResizedNotification,
+                     kAXUIElementDestroyedNotification, kAXWindowMiniaturizedNotification,
+                     kAXWindowDeminiaturizedNotification] {
+            if try subscribe(observer, element: window, name: name) { windowNotifications.append(name) }
+        }
+    }
+
+    private func unobserveWindow() {
+        if let observer, let window = observedWindow {
+            for name in windowNotifications {
+                let error = AXObserverRemoveNotification(observer, window, name as CFString)
+                // A destroyed window can invalidate its own registrations.
+                if error != .success && error != .invalidUIElement && error != .notificationNotRegistered {
+                    logger.error("Remove \(name, privacy: .public): AXError \(error.rawValue)")
+                }
+            }
+        }
+        windowNotifications.removeAll()
+        observedWindow = nil
+    }
+
+    private func subscribe(_ observer: AXObserver, element: AXUIElement, name: String) throws -> Bool {
+        let error = AXObserverAddNotification(observer, element, name as CFString,
+                                              Unmanaged.passUnretained(self).toOpaque())
+        switch error {
+        case .success, .notificationAlreadyRegistered: return true
+        case .notificationUnsupported, .notImplemented:
+            logger.notice("Application does not support \(name, privacy: .public)")
+            return false
+        default: throw FocusTrackingError.accessibility("Observe \(name)", error)
+        }
+    }
+
+    private func hideBorder() {
+        highlightWindow.orderOut(nil)
+        lastFrame = nil
+    }
+
+    nonisolated private static func accessibilityNotification(
+        observer: AXObserver, element: AXUIElement, notification: CFString, context: UnsafeMutableRawPointer?
+    ) {
+        guard let context else { return }
+        let highlighter = Unmanaged<FocusHighlighter>.fromOpaque(context).takeUnretainedValue()
+        // This observer's source is installed exclusively on the main run loop.
+        MainActor.assumeIsolated {
+            // Ignore notifications from an app we have already disconnected.
+            guard let current = highlighter.observer, CFEqual(current, observer) else { return }
+            highlighter.requestRefresh()
+        }
+    }
 }
